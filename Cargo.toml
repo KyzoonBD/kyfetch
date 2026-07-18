@@ -1,0 +1,15 @@
+[package]
+name = "kyfetch"
+version = "0.1.0"
+edition = "2024"
+description = "Simple internal-URL crawler (mini Screaming Frog)"
+license = "MIT"
+repository = "https://github.com/KyzoonBD/kyfetch"
+
+[dependencies]
+clap = { version = "4.6.2", features = ["derive"] }
+futures = "0.3.32"
+reqwest = { version = "0.13.4", features = ["gzip", "http2"] }
+scraper = "0.27.0"
+tokio = { version = "1.53.0", features = ["full"] }
+url = "2.5.8"
