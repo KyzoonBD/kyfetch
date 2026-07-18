@@ -46,10 +46,14 @@ kyfetch example.com -i 200          # 200ms between requests
 | `-c, --concurrency` | parallel requests | 20 |
 | `-t, --timeout` | request timeout (sec) | 10 |
 | `-i, --interval` | delay between requests (ms) — rate-limit | 0 |
+| `--keep-404` | keep 404 pages instead of skipping them | off |
 | `-o, --output` | save URLs to text file | — |
 | `-x, --xlsx` | export results to `.xlsx` | — |
 
-Output: `status  url  [content-type]`, one row per page. Errors show `ERR [reason]`.
+Output: colored table `status  url  [content-type]`, one row per page, then a
+summary (total, ok/redirect/error counts, skipped 404s, elapsed time). Errors
+show `ERR [reason]`. **404 pages are skipped by default** — pass `--keep-404`
+to include them.
 
 ## What it does
 

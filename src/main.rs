@@ -3,9 +3,11 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
+use dialoguer::console::style;
+use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Select};
 use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -38,6 +40,10 @@ struct Args {
     #[arg(short = 'i', long, default_value_t = 0)]
     interval: u64,
 
+    /// Keep 404 (not found) pages in results instead of skipping them
+    #[arg(long, default_value_t = false)]
+    keep_404: bool,
+
     /// Write URLs to text file, one per line
     #[arg(short = 'o', long)]
     output: Option<String>,
@@ -55,6 +61,7 @@ struct Config {
     concurrency: usize,
     timeout: u64,
     interval: u64,
+    keep_404: bool,
     interactive: bool,
     output: Option<String>,
     xlsx: Option<String>,
@@ -101,8 +108,6 @@ async fn main() {
 
     let results = crawl(&cfg).await;
 
-    eprintln!("\nTotal: {} URLs", results.len());
-
     // Non-interactive file outputs (from flags).
     if let Some(path) = &cfg.output {
         save_txt(path, &results);
@@ -142,6 +147,7 @@ fn build_config(args: Args) -> Result<Config, String> {
         concurrency,
         timeout,
         interval,
+        keep_404: args.keep_404,
         interactive,
         output: args.output,
         xlsx: args.xlsx,
@@ -150,22 +156,27 @@ fn build_config(args: Args) -> Result<Config, String> {
 
 /// Interactive prompts for URL, page limit, and interval.
 fn prompt_settings() -> Result<(Url, usize, usize, u64, u64), String> {
-    println!("kyfetch — internal URL crawler\n");
+    let theme = ColorfulTheme::default();
+
+    println!();
+    println!("  {}", style("kyfetch").cyan().bold());
+    println!("  {}", style("internal URL crawler").dim());
+    println!();
 
     // URL (loop until parseable).
     let start = loop {
-        let raw: String = Input::new()
+        let raw: String = Input::with_theme(&theme)
             .with_prompt("Site URL")
             .interact_text()
             .map_err(|e| e.to_string())?;
         match parse_url(&raw) {
             Ok(u) => break u,
-            Err(e) => eprintln!("  invalid URL: {e}\n"),
+            Err(e) => eprintln!("  {} {e}\n", style("invalid URL:").red()),
         }
     };
 
     // How many URLs, or all.
-    let amount: String = Input::new()
+    let amount: String = Input::with_theme(&theme)
         .with_prompt("How many URLs? (number or 'all')")
         .default("all".into())
         .interact_text()
@@ -177,19 +188,20 @@ fn prompt_settings() -> Result<(Url, usize, usize, u64, u64), String> {
     };
 
     // Concurrency.
-    let concurrency: usize = Input::new()
+    let concurrency: usize = Input::with_theme(&theme)
         .with_prompt("Concurrent requests")
         .default(20)
         .interact_text()
         .map_err(|e| e.to_string())?;
 
     // Interval between requests (safety / avoid blocks).
-    let interval: u64 = Input::new()
+    let interval: u64 = Input::with_theme(&theme)
         .with_prompt("Interval between requests in ms (0 = none)")
         .default(0)
         .interact_text()
         .map_err(|e| e.to_string())?;
 
+    println!();
     Ok((start, max_pages, concurrency.max(1), 10, interval))
 }
 
@@ -207,11 +219,13 @@ async fn crawl(cfg: &Config) -> Vec<PageResult> {
 
     let link_sel = Selector::parse("a[href]").unwrap();
     let mut results: Vec<PageResult> = Vec::new();
+    let mut skipped_404: usize = 0;
+    let started = Instant::now();
 
     // Progress spinner: shows fetched count + how many still queued.
     let pb = ProgressBar::new_spinner();
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} {msg}")
+        ProgressStyle::with_template("  {spinner:.cyan} {msg}")
             .unwrap()
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
     );
@@ -258,7 +272,22 @@ async fn crawl(cfg: &Config) -> Vec<PageResult> {
                     });
                 }
                 Ok(r) => {
-                    let status = r.status().as_u16().to_string();
+                    let code = r.status().as_u16();
+
+                    // Skip 404s (default) — don't store, don't parse links.
+                    if code == 404 && !cfg.keep_404 {
+                        skipped_404 += 1;
+                        let queued = queue.lock().await.len();
+                        pb.set_message(format!(
+                            "fetched {} · queued {} · skipped 404: {}",
+                            results.len(),
+                            queued,
+                            skipped_404
+                        ));
+                        continue;
+                    }
+
+                    let status = code.to_string();
                     let ctype = r
                         .headers()
                         .get(reqwest::header::CONTENT_TYPE)
@@ -288,24 +317,81 @@ async fn crawl(cfg: &Config) -> Vec<PageResult> {
             }
 
             let queued = queue.lock().await.len();
-            pb.set_message(format!("fetched {} · queued {}", results.len(), queued));
+            pb.set_message(format!(
+                "fetched {} · queued {} · skipped 404: {}",
+                results.len(),
+                queued,
+                skipped_404
+            ));
         }
     }
 
     pb.finish_and_clear();
+    print_report(&results, skipped_404, started.elapsed());
+    results
+}
 
-    // Print result table.
-    for r in &results {
-        println!("{:>4}  {}  [{}]", r.status, r.url, r.ctype);
+/// Colored status code: 2xx green, 3xx cyan, 4xx/5xx red, ERR red.
+fn color_status(status: &str) -> String {
+    let styled = match status.chars().next() {
+        Some('2') => style(status).green(),
+        Some('3') => style(status).cyan(),
+        Some('4') | Some('5') => style(status).red(),
+        _ => style(status).red().dim(),
+    };
+    format!("{styled}")
+}
+
+/// Print the result table plus a summary block.
+fn print_report(results: &[PageResult], skipped_404: usize, elapsed: Duration) {
+    println!();
+    for r in results {
+        println!(
+            "  {:>4}  {}  {}",
+            color_status(&r.status),
+            r.url,
+            style(format!("[{}]", r.ctype)).dim()
+        );
     }
 
-    results
+    // Tally status classes.
+    let (mut ok, mut redir, mut err) = (0usize, 0usize, 0usize);
+    for r in results {
+        match r.status.chars().next() {
+            Some('2') => ok += 1,
+            Some('3') => redir += 1,
+            _ => err += 1,
+        }
+    }
+
+    println!();
+    println!("  {}", style("─".repeat(40)).dim());
+    println!(
+        "  {}  {}   {}  {}   {}  {}   {}  {}",
+        style("total").dim(),
+        style(results.len()).bold(),
+        style("ok").green(),
+        ok,
+        style("redirect").cyan(),
+        redir,
+        style("error").red(),
+        err,
+    );
+    println!(
+        "  {} {}   {} {:.1}s",
+        style("skipped 404:").dim(),
+        skipped_404,
+        style("time:").dim(),
+        elapsed.as_secs_f64(),
+    );
+    println!();
 }
 
 /// Ask the user how to export, then write the file(s).
 fn prompt_export(results: &[PageResult]) {
+    let theme = ColorfulTheme::default();
     let choices = ["None", "Text (.txt)", "Excel (.xlsx)", "Both"];
-    let pick = Select::new()
+    let pick = Select::with_theme(&theme)
         .with_prompt("Export results?")
         .items(&choices)
         .default(0)
@@ -316,7 +402,7 @@ fn prompt_export(results: &[PageResult]) {
     let want_xlsx = pick == 2 || pick == 3;
 
     if want_txt {
-        let name: String = Input::new()
+        let name: String = Input::with_theme(&theme)
             .with_prompt("Text filename")
             .default("urls.txt".into())
             .interact_text()
@@ -324,7 +410,7 @@ fn prompt_export(results: &[PageResult]) {
         save_txt(&name, results);
     }
     if want_xlsx {
-        let name: String = Input::new()
+        let name: String = Input::with_theme(&theme)
             .with_prompt("Excel filename")
             .default("urls.xlsx".into())
             .interact_text()
@@ -337,16 +423,16 @@ fn prompt_export(results: &[PageResult]) {
 fn save_txt(path: &str, results: &[PageResult]) {
     let body: String = results.iter().map(|r| format!("{}\n", r.url)).collect();
     match std::fs::write(path, body) {
-        Ok(()) => eprintln!("Saved {path}"),
-        Err(e) => eprintln!("write failed: {e}"),
+        Ok(()) => eprintln!("  {} saved {path}", style("✓").green()),
+        Err(e) => eprintln!("  {} write failed: {e}", style("✗").red()),
     }
 }
 
 /// Write results to xlsx, reporting the outcome.
 fn save_xlsx(path: &str, results: &[PageResult]) {
     match write_xlsx(path, results) {
-        Ok(()) => eprintln!("Exported {path}"),
-        Err(e) => eprintln!("xlsx export failed: {e}"),
+        Ok(()) => eprintln!("  {} exported {path}", style("✓").green()),
+        Err(e) => eprintln!("  {} xlsx export failed: {e}", style("✗").red()),
     }
 }
 
