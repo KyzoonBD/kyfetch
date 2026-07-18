@@ -20,17 +20,32 @@ cargo install --path .
 
 ## Usage
 
+### Interactive
+
+Run with no URL — kyfetch prompts for everything:
+
+```sh
+kyfetch
+```
+
+It asks for: site URL, how many URLs (a number or `all`), concurrency,
+interval, shows a live progress spinner, then asks how to export.
+
+### Flags (scripting)
+
 ```sh
 kyfetch https://example.com
 kyfetch example.com -n 1000 -c 50 -o urls.txt
 kyfetch example.com -x report.xlsx
+kyfetch example.com -i 200          # 200ms between requests
 ```
 
 | Flag | Meaning | Default |
 |------|---------|---------|
-| `-n, --max-pages` | max pages to crawl | 500 |
+| `-n, --max-pages` | max pages to crawl (0 = all) | 500 |
 | `-c, --concurrency` | parallel requests | 20 |
 | `-t, --timeout` | request timeout (sec) | 10 |
+| `-i, --interval` | delay between requests (ms) — rate-limit | 0 |
 | `-o, --output` | save URLs to text file | — |
 | `-x, --xlsx` | export results to `.xlsx` | — |
 

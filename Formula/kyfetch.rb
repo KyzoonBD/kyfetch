@@ -1,8 +1,8 @@
 class Kyfetch < Formula
   desc "Simple internal-URL crawler (mini Screaming Frog)"
   homepage "https://github.com/KyzoonBD/kyfetch"
-  url "https://github.com/KyzoonBD/kyfetch/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "6cb0baacc130c174068be839e59356bb571caeed8581e16fbf8eaa87d478cf8f"
+  url "https://github.com/KyzoonBD/kyfetch/archive/refs/tags/v0.2.0.tar.gz"
+  sha256 "PENDING_AFTER_TAG"
   license "MIT"
   head "https://github.com/KyzoonBD/kyfetch.git", branch: "main"
 

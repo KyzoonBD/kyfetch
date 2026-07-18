@@ -1,6 +1,6 @@
 [package]
 name = "kyfetch"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Simple internal-URL crawler (mini Screaming Frog)"
 license = "MIT"
@@ -8,7 +8,9 @@ repository = "https://github.com/KyzoonBD/kyfetch"
 
 [dependencies]
 clap = { version = "4.6.2", features = ["derive"] }
+dialoguer = { version = "0.12.0", default-features = false }
 futures = "0.3.32"
+indicatif = "0.18.6"
 reqwest = { version = "0.13.4", features = ["gzip", "http2"] }
 rust_xlsxwriter = "0.96.0"
 scraper = "0.27.0"
