@@ -23,6 +23,7 @@ cargo install --path .
 ```sh
 kyfetch https://example.com
 kyfetch example.com -n 1000 -c 50 -o urls.txt
+kyfetch example.com -x report.xlsx
 ```
 
 | Flag | Meaning | Default |
@@ -30,7 +31,8 @@ kyfetch example.com -n 1000 -c 50 -o urls.txt
 | `-n, --max-pages` | max pages to crawl | 500 |
 | `-c, --concurrency` | parallel requests | 20 |
 | `-t, --timeout` | request timeout (sec) | 10 |
-| `-o, --output` | save URLs to file | — |
+| `-o, --output` | save URLs to text file | — |
+| `-x, --xlsx` | export results to `.xlsx` | — |
 
 Output: `status  url  [content-type]`, one row per page. Errors show `ERR [reason]`.
 

@@ -35,6 +35,10 @@ struct Args {
     /// Write URLs to file, one per line
     #[arg(short = 'o', long)]
     output: Option<String>,
+
+    /// Export results to an .xlsx spreadsheet
+    #[arg(short = 'x', long)]
+    xlsx: Option<String>,
 }
 
 /// A crawled page result.
@@ -171,6 +175,41 @@ async fn main() {
             eprintln!("Saved to {path}");
         }
     }
+
+    if let Some(path) = args.xlsx {
+        match write_xlsx(&path, &results) {
+            Ok(()) => eprintln!("Exported to {path}"),
+            Err(e) => eprintln!("xlsx export failed: {e}"),
+        }
+    }
+}
+
+/// Write results to an .xlsx spreadsheet: Status | URL | Content-Type.
+fn write_xlsx(path: &str, results: &[PageResult]) -> Result<(), rust_xlsxwriter::XlsxError> {
+    use rust_xlsxwriter::{Format, Workbook};
+
+    let mut wb = Workbook::new();
+    let sheet = wb.add_worksheet().set_name("URLs")?;
+
+    let header = Format::new().set_bold();
+    sheet.write_string_with_format(0, 0, "Status", &header)?;
+    sheet.write_string_with_format(0, 1, "URL", &header)?;
+    sheet.write_string_with_format(0, 2, "Content-Type", &header)?;
+
+    for (i, r) in results.iter().enumerate() {
+        let row = (i + 1) as u32;
+        sheet.write_string(row, 0, &r.status)?;
+        sheet.write_string(row, 1, &r.url)?;
+        sheet.write_string(row, 2, &r.ctype)?;
+    }
+
+    sheet.set_column_width(0, 8)?;
+    sheet.set_column_width(1, 70)?;
+    sheet.set_column_width(2, 20)?;
+    sheet.autofilter(0, 0, results.len() as u32, 2)?;
+
+    wb.save(path)?;
+    Ok(())
 }
 
 /// Parse HTML, return same-domain, normalized, http(s) links.
