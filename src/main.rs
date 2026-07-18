@@ -407,7 +407,8 @@ fn prompt_export(results: &[PageResult]) {
             .default("urls.txt".into())
             .interact_text()
             .unwrap_or_else(|_| "urls.txt".into());
-        save_txt(&name, results);
+        let path = desktop_path(&name, "txt");
+        save_txt(&path, results);
     }
     if want_xlsx {
         let name: String = Input::with_theme(&theme)
@@ -415,7 +416,31 @@ fn prompt_export(results: &[PageResult]) {
             .default("urls.xlsx".into())
             .interact_text()
             .unwrap_or_else(|_| "urls.xlsx".into());
-        save_xlsx(&name, results);
+        let path = desktop_path(&name, "xlsx");
+        save_xlsx(&path, results);
+    }
+}
+
+/// Build a full save path: put the file on the Desktop and ensure it has the
+/// right extension. If the user typed an absolute path, respect it as-is.
+fn desktop_path(name: &str, ext: &str) -> String {
+    let mut name = name.trim().to_string();
+
+    // Add extension if missing.
+    if !name.to_lowercase().ends_with(&format!(".{ext}")) {
+        name.push('.');
+        name.push_str(ext);
+    }
+
+    // Absolute path or already has a directory → leave it alone.
+    if name.starts_with('/') || name.contains('/') {
+        return name;
+    }
+
+    // Otherwise drop it on the Desktop.
+    match std::env::var("HOME") {
+        Ok(home) => format!("{home}/Desktop/{name}"),
+        Err(_) => name,
     }
 }
 
