@@ -29,7 +29,8 @@ kyfetch
 ```
 
 It asks for: site URL, how many URLs (a number or `all`), concurrency,
-interval, shows a live progress spinner, then asks how to export.
+interval, which paths to restrict to, shows a live progress spinner, then asks
+how to export. Press **Ctrl-C** any time to stop and keep results so far.
 
 ### Flags (scripting)
 
@@ -38,6 +39,8 @@ kyfetch https://example.com
 kyfetch example.com -n 1000 -c 50 -o urls.txt
 kyfetch example.com -x report.xlsx
 kyfetch example.com -i 200          # 200ms between requests
+kyfetch example.com -p /products    # only crawl /products paths
+kyfetch example.com -p /products -p /blog   # multiple paths
 ```
 
 | Flag | Meaning | Default |
@@ -47,6 +50,7 @@ kyfetch example.com -i 200          # 200ms between requests
 | `-t, --timeout` | request timeout (sec) | 10 |
 | `-i, --interval` | delay between requests (ms) — rate-limit | 0 |
 | `--keep-404` | keep 404 pages instead of skipping them | off |
+| `-p, --path` | only crawl paths under this prefix (repeatable) | all |
 | `-o, --output` | save URLs to text file | — |
 | `-x, --xlsx` | export results to `.xlsx` | — |
 
@@ -61,6 +65,8 @@ to include them.
 - Real HTML parse → resolves relative URLs (`/foo`, `../bar`)
 - Strips fragment + trailing slash → clean dedupe
 - Follows only `text/html` for more links
+- Optional path filter (`-p`) restricts crawl to given prefixes
+- Ctrl-C stops the crawl and keeps partial results (still exportable)
 
 ---
 

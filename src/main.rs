@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -44,6 +45,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     keep_404: bool,
 
+    /// Only crawl paths matching these prefixes (repeatable), e.g. -p /products
+    #[arg(short = 'p', long = "path")]
+    paths: Vec<String>,
+
     /// Write URLs to text file, one per line
     #[arg(short = 'o', long)]
     output: Option<String>,
@@ -62,6 +67,8 @@ struct Config {
     timeout: u64,
     interval: u64,
     keep_404: bool,
+    /// Path prefixes to restrict crawl to (empty = whole site).
+    path_filters: Vec<String>,
     interactive: bool,
     output: Option<String>,
     xlsx: Option<String>,
@@ -82,6 +89,33 @@ fn normalize(mut u: Url) -> Url {
         u.set_path(&p);
     }
     u
+}
+
+/// Normalize a path filter: ensure leading slash, drop trailing slash.
+/// Blank filters return None so they're ignored.
+fn normalize_filter(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut s = s.to_string();
+    if !s.starts_with('/') {
+        s.insert(0, '/');
+    }
+    if s.len() > 1 && s.ends_with('/') {
+        s = s.trim_end_matches('/').to_string();
+    }
+    Some(s)
+}
+
+/// True if `path` falls under any filter prefix (segment-aware). Empty = all.
+fn path_allowed(path: &str, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    filters
+        .iter()
+        .any(|f| path == f || path.starts_with(&format!("{f}/")))
 }
 
 /// Parse a raw URL string, adding https:// if scheme missing.
@@ -126,12 +160,13 @@ async fn main() {
 fn build_config(args: Args) -> Result<Config, String> {
     let interactive = args.url.is_none();
 
-    let (start, max_pages, concurrency, timeout, interval) = if interactive {
+    let (start, max_pages, concurrency, timeout, interval, path_filters) = if interactive {
         prompt_settings()?
     } else {
         let start = parse_url(args.url.as_ref().unwrap())?;
         let max = if args.max_pages == 0 { usize::MAX } else { args.max_pages };
-        (start, max, args.concurrency, args.timeout, args.interval)
+        let filters: Vec<String> = args.paths.iter().filter_map(|s| normalize_filter(s)).collect();
+        (start, max, args.concurrency, args.timeout, args.interval, filters)
     };
 
     let start = normalize(start);
@@ -148,6 +183,7 @@ fn build_config(args: Args) -> Result<Config, String> {
         timeout,
         interval,
         keep_404: args.keep_404,
+        path_filters,
         interactive,
         output: args.output,
         xlsx: args.xlsx,
@@ -155,7 +191,7 @@ fn build_config(args: Args) -> Result<Config, String> {
 }
 
 /// Interactive prompts for URL, page limit, and interval.
-fn prompt_settings() -> Result<(Url, usize, usize, u64, u64), String> {
+fn prompt_settings() -> Result<(Url, usize, usize, u64, u64, Vec<String>), String> {
     let theme = ColorfulTheme::default();
 
     println!();
@@ -201,8 +237,17 @@ fn prompt_settings() -> Result<(Url, usize, usize, u64, u64), String> {
         .interact_text()
         .map_err(|e| e.to_string())?;
 
+    // Path filter (comma-separated prefixes; blank = whole site).
+    let paths_raw: String = Input::with_theme(&theme)
+        .with_prompt("Only these paths? (comma-separated, e.g. /products,/blog — blank = all)")
+        .allow_empty(true)
+        .default(String::new())
+        .interact_text()
+        .map_err(|e| e.to_string())?;
+    let path_filters: Vec<String> = paths_raw.split(',').filter_map(normalize_filter).collect();
+
     println!();
-    Ok((start, max_pages, concurrency.max(1), 10, interval))
+    Ok((start, max_pages, concurrency.max(1), 10, interval, path_filters))
 }
 
 /// Run the BFS crawl with a live progress bar.
@@ -217,6 +262,17 @@ async fn crawl(cfg: &Config) -> Vec<PageResult> {
     let queue: Arc<Mutex<Vec<Url>>> = Arc::new(Mutex::new(vec![cfg.start.clone()]));
     seen.lock().await.insert(cfg.start.as_str().to_string());
 
+    // Ctrl-C sets this flag; the crawl loop breaks and still reports/exports.
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+
     let link_sel = Selector::parse("a[href]").unwrap();
     let mut results: Vec<PageResult> = Vec::new();
     let mut skipped_404: usize = 0;
@@ -230,9 +286,10 @@ async fn crawl(cfg: &Config) -> Vec<PageResult> {
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
     );
     pb.enable_steady_tick(Duration::from_millis(100));
+    eprintln!("  {}", style("press Ctrl-C to stop and keep results so far").dim());
 
     loop {
-        if results.len() >= cfg.max_pages {
+        if results.len() >= cfg.max_pages || stop.load(Ordering::Relaxed) {
             break;
         }
 
@@ -262,14 +319,17 @@ async fn crawl(cfg: &Config) -> Vec<PageResult> {
         }
 
         while let Some((url, resp)) = futs.next().await {
+            let store = path_allowed(url.path(), &cfg.path_filters);
             match resp {
                 Err(e) => {
                     let msg = if e.is_timeout() { "TIMEOUT".into() } else { format!("{e}") };
-                    results.push(PageResult {
-                        url: url.to_string(),
-                        status: "ERR".into(),
-                        ctype: msg.chars().take(50).collect(),
-                    });
+                    if store {
+                        results.push(PageResult {
+                            url: url.to_string(),
+                            status: "ERR".into(),
+                            ctype: msg.chars().take(50).collect(),
+                        });
+                    }
                 }
                 Ok(r) => {
                     let code = r.status().as_u16();
@@ -305,6 +365,10 @@ async fn crawl(cfg: &Config) -> Vec<PageResult> {
                             let mut seen_g = seen.lock().await;
                             let mut q = queue.lock().await;
                             for l in links {
+                                // Only follow links under the path filter (empty = all).
+                                if !path_allowed(l.path(), &cfg.path_filters) {
+                                    continue;
+                                }
                                 if seen_g.insert(l.as_str().to_string()) {
                                     q.push(l);
                                 }
@@ -312,7 +376,9 @@ async fn crawl(cfg: &Config) -> Vec<PageResult> {
                         }
                     }
 
-                    results.push(PageResult { url: url.to_string(), status, ctype });
+                    if store {
+                        results.push(PageResult { url: url.to_string(), status, ctype });
+                    }
                 }
             }
 
@@ -323,11 +389,16 @@ async fn crawl(cfg: &Config) -> Vec<PageResult> {
                 queued,
                 skipped_404
             ));
+
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
         }
     }
 
     pb.finish_and_clear();
-    print_report(&results, skipped_404, started.elapsed());
+    let stopped = stop.load(Ordering::Relaxed);
+    print_report(&results, skipped_404, started.elapsed(), stopped);
     results
 }
 
@@ -343,8 +414,12 @@ fn color_status(status: &str) -> String {
 }
 
 /// Print the result table plus a summary block.
-fn print_report(results: &[PageResult], skipped_404: usize, elapsed: Duration) {
+fn print_report(results: &[PageResult], skipped_404: usize, elapsed: Duration, stopped: bool) {
     println!();
+    if stopped {
+        println!("  {}", style("⏹ stopped early (Ctrl-C) — partial results below").yellow());
+        println!();
+    }
     for r in results {
         println!(
             "  {:>4}  {}  {}",
