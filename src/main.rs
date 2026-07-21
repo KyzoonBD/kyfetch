@@ -17,7 +17,11 @@ use scraper::{Html, Selector};
 use tokio::sync::Mutex;
 use url::Url;
 
-const USER_AGENT: &str = "kyfetch/1.0 internal-crawler";
+/// Default UA: a real browser string. Many sites (Cloudflare etc.) 403 a
+/// bot-looking UA, which yields 0 crawled URLs. Override with --user-agent.
+const USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 #[derive(Parser)]
 #[command(name = "kyfetch", version, about = "Fetch internal URLs of a site (mini Screaming Frog).")]
@@ -56,6 +60,10 @@ struct Args {
     /// Export results to an .xlsx spreadsheet
     #[arg(short = 'x', long)]
     xlsx: Option<String>,
+
+    /// User-Agent header to send (default: a Chrome browser string)
+    #[arg(short = 'u', long)]
+    user_agent: Option<String>,
 }
 
 /// Resolved crawl settings (from flags or interactive prompts).
@@ -72,6 +80,8 @@ struct Config {
     interactive: bool,
     output: Option<String>,
     xlsx: Option<String>,
+    /// User-Agent header sent on every request.
+    user_agent: String,
 }
 
 /// A crawled page result.
@@ -187,6 +197,7 @@ fn build_config(args: Args) -> Result<Config, String> {
         interactive,
         output: args.output,
         xlsx: args.xlsx,
+        user_agent: args.user_agent.unwrap_or_else(|| USER_AGENT.to_string()),
     })
 }
 
@@ -253,7 +264,7 @@ fn prompt_settings() -> Result<(Url, usize, usize, u64, u64, Vec<String>), Strin
 /// Run the BFS crawl with a live progress bar.
 async fn crawl(cfg: &Config) -> Vec<PageResult> {
     let client = Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(&cfg.user_agent)
         .timeout(Duration::from_secs(cfg.timeout))
         .build()
         .expect("build client");
