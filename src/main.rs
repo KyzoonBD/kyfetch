@@ -64,6 +64,11 @@ struct Args {
     /// User-Agent header to send (default: a Chrome browser string)
     #[arg(short = 'u', long)]
     user_agent: Option<String>,
+
+    /// Read URLs from the site's sitemap instead of following links.
+    /// Needed for JS-rendered sites (Next.js etc.) whose links aren't in HTML.
+    #[arg(short = 's', long, default_value_t = false)]
+    sitemap: bool,
 }
 
 /// Resolved crawl settings (from flags or interactive prompts).
@@ -82,6 +87,8 @@ struct Config {
     xlsx: Option<String>,
     /// User-Agent header sent on every request.
     user_agent: String,
+    /// Seed the queue from the sitemap and don't follow HTML links.
+    sitemap: bool,
 }
 
 /// A crawled page result.
@@ -170,13 +177,13 @@ async fn main() {
 fn build_config(args: Args) -> Result<Config, String> {
     let interactive = args.url.is_none();
 
-    let (start, max_pages, concurrency, timeout, interval, path_filters) = if interactive {
+    let (start, max_pages, concurrency, timeout, interval, path_filters, sitemap) = if interactive {
         prompt_settings()?
     } else {
         let start = parse_url(args.url.as_ref().unwrap())?;
         let max = if args.max_pages == 0 { usize::MAX } else { args.max_pages };
         let filters: Vec<String> = args.paths.iter().filter_map(|s| normalize_filter(s)).collect();
-        (start, max, args.concurrency, args.timeout, args.interval, filters)
+        (start, max, args.concurrency, args.timeout, args.interval, filters, args.sitemap)
     };
 
     let start = normalize(start);
@@ -198,11 +205,12 @@ fn build_config(args: Args) -> Result<Config, String> {
         output: args.output,
         xlsx: args.xlsx,
         user_agent: args.user_agent.unwrap_or_else(|| USER_AGENT.to_string()),
+        sitemap,
     })
 }
 
 /// Interactive prompts for URL, page limit, and interval.
-fn prompt_settings() -> Result<(Url, usize, usize, u64, u64, Vec<String>), String> {
+fn prompt_settings() -> Result<(Url, usize, usize, u64, u64, Vec<String>, bool), String> {
     let theme = ColorfulTheme::default();
 
     println!();
@@ -257,8 +265,22 @@ fn prompt_settings() -> Result<(Url, usize, usize, u64, u64, Vec<String>), Strin
         .map_err(|e| e.to_string())?;
     let path_filters: Vec<String> = paths_raw.split(',').filter_map(normalize_filter).collect();
 
+    // How to discover URLs. Sitemap mode is needed for JavaScript-rendered
+    // sites (Next.js, React, etc.) whose links aren't present in the raw HTML.
+    let sm_choices = [
+        "Follow links in the page (default — works for most sites)",
+        "Read the site's sitemap (for JavaScript sites like Next.js/React)",
+    ];
+    let sm_pick = Select::with_theme(&theme)
+        .with_prompt("How should kyfetch find URLs?")
+        .items(&sm_choices)
+        .default(0)
+        .interact()
+        .map_err(|e| e.to_string())?;
+    let sitemap = sm_pick == 1;
+
     println!();
-    Ok((start, max_pages, concurrency.max(1), 10, interval, path_filters))
+    Ok((start, max_pages, concurrency.max(1), 10, interval, path_filters, sitemap))
 }
 
 /// Run the BFS crawl with a live progress bar.
@@ -269,9 +291,29 @@ async fn crawl(cfg: &Config) -> Vec<PageResult> {
         .build()
         .expect("build client");
 
+    // Seed the queue. Sitemap mode pulls URLs from the site's sitemap; normal
+    // mode starts from the single start URL and discovers links as it goes.
+    let seed: Vec<Url> = if cfg.sitemap {
+        eprintln!("  {}", style("reading sitemap…").dim());
+        let urls = collect_sitemap_urls(&client, cfg).await;
+        if urls.is_empty() {
+            eprintln!("  {} no sitemap URLs found", style("✗").red());
+        } else {
+            eprintln!("  {} {} URLs from sitemap", style("✓").green(), urls.len());
+        }
+        urls
+    } else {
+        vec![cfg.start.clone()]
+    };
+
     let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    let queue: Arc<Mutex<Vec<Url>>> = Arc::new(Mutex::new(vec![cfg.start.clone()]));
-    seen.lock().await.insert(cfg.start.as_str().to_string());
+    {
+        let mut s = seen.lock().await;
+        for u in &seed {
+            s.insert(u.as_str().to_string());
+        }
+    }
+    let queue: Arc<Mutex<Vec<Url>>> = Arc::new(Mutex::new(seed));
 
     // Ctrl-C sets this flag; the crawl loop breaks and still reports/exports.
     let stop = Arc::new(AtomicBool::new(false));
@@ -370,7 +412,8 @@ async fn crawl(cfg: &Config) -> Vec<PageResult> {
                         .to_string();
                     let final_url = r.url().clone();
 
-                    if ctype.contains("text/html") {
+                    // Sitemap mode: queue is already the full list, don't follow links.
+                    if !cfg.sitemap && ctype.contains("text/html") {
                         if let Ok(body) = r.text().await {
                             let links = extract_links(&body, &final_url, &link_sel, &cfg.root_host);
                             let mut seen_g = seen.lock().await;
@@ -573,6 +616,96 @@ fn write_xlsx(path: &str, results: &[PageResult]) -> Result<(), rust_xlsxwriter:
 
     wb.save(path)?;
     Ok(())
+}
+
+/// Discover sitemap URLs for the site: read robots.txt for `Sitemap:` lines,
+/// falling back to `/sitemap.xml` at the origin.
+async fn discover_sitemaps(client: &Client, cfg: &Config) -> Vec<Url> {
+    let mut out = Vec::new();
+    if let Ok(robots) = cfg.start.join("/robots.txt") {
+        if let Ok(resp) = client.get(robots).send().await {
+            if let Ok(body) = resp.text().await {
+                for line in body.lines() {
+                    let line = line.trim();
+                    if let Some(rest) = line.strip_prefix("Sitemap:").or_else(|| line.strip_prefix("sitemap:")) {
+                        if let Ok(u) = Url::parse(rest.trim()) {
+                            out.push(u);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        if let Ok(u) = cfg.start.join("/sitemap.xml") {
+            out.push(u);
+        }
+    }
+    out
+}
+
+/// Extract every `<loc>…</loc>` value from a sitemap XML body.
+fn parse_locs(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<loc>") {
+        rest = &rest[start + 5..];
+        if let Some(end) = rest.find("</loc>") {
+            out.push(rest[..end].trim().to_string());
+            rest = &rest[end + 6..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Recursively fetch sitemap(s), following sitemapindex entries, and collect
+/// all same-host page URLs that pass the path filter. Bounded to max_pages.
+async fn collect_sitemap_urls(client: &Client, cfg: &Config) -> Vec<Url> {
+    let mut to_fetch = discover_sitemaps(client, cfg).await;
+    let mut fetched: HashSet<String> = HashSet::new();
+    let mut seen_pages: HashSet<String> = HashSet::new();
+    let mut pages: Vec<Url> = Vec::new();
+
+    // Guard against runaway sitemapindex trees.
+    let mut budget = 200usize;
+
+    while let Some(sm) = to_fetch.pop() {
+        if budget == 0 || pages.len() >= cfg.max_pages {
+            break;
+        }
+        budget -= 1;
+        if !fetched.insert(sm.as_str().to_string()) {
+            continue;
+        }
+        let Ok(resp) = client.get(sm.clone()).send().await else { continue };
+        let Ok(body) = resp.text().await else { continue };
+
+        // A <sitemapindex> lists more sitemaps; a <urlset> lists pages.
+        let is_index = body.contains("<sitemapindex");
+        for loc in parse_locs(&body) {
+            let Ok(u) = Url::parse(&loc) else { continue };
+            if is_index {
+                to_fetch.push(u);
+            } else {
+                if u.host_str() != Some(cfg.root_host.as_str()) {
+                    continue;
+                }
+                if !path_allowed(u.path(), &cfg.path_filters) {
+                    continue;
+                }
+                let u = normalize(u);
+                if seen_pages.insert(u.as_str().to_string()) {
+                    pages.push(u);
+                    if pages.len() >= cfg.max_pages {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    pages
 }
 
 /// Parse HTML, return same-domain, normalized, http(s) links.
